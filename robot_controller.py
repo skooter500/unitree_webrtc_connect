@@ -7,13 +7,22 @@ from tkinter import ttk, messagebox, StringVar
 import threading
 import time
 from functools import partial
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+from queue import Queue
 
 from go2_webrtc_driver.webrtc_driver import Go2WebRTCConnection, WebRTCConnectionMethod
 from go2_webrtc_driver.constants import RTC_TOPIC, SPORT_CMD
+from aiortc import MediaStreamTrack
 
 # Enable logging for debugging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Default camera frame size
+DEFAULT_CAMERA_WIDTH = 640
+DEFAULT_CAMERA_HEIGHT = 360
 
 class RobotController:
     def __init__(self, root):
@@ -38,6 +47,12 @@ class RobotController:
         
         # Movement variables
         self.speed = tk.DoubleVar(value=0.5)
+        
+        # Camera variables
+        self.frame_queue = Queue()
+        self.camera_enabled = tk.BooleanVar(value=False)
+        self.camera_update_id = None
+        self.last_frame = None
         
         # Create UI
         self.create_ui()
@@ -65,6 +80,11 @@ class RobotController:
         actions_frame = ttk.Frame(notebook, padding="10")
         notebook.add(actions_frame, text="Actions")
         self.create_actions_panel(actions_frame)
+        
+        # Camera tab
+        camera_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(camera_frame, text="Camera")
+        self.create_camera_panel(camera_frame)
         
         # Status bar at the bottom
         self.status_var = tk.StringVar(value="Not connected")
@@ -238,6 +258,153 @@ class RobotController:
                               command=lambda: self.send_command("bound"))
         bound_btn.grid(row=0, column=2, padx=5, pady=5)
         
+    def create_camera_panel(self, parent):
+        # Camera control frame
+        control_frame = ttk.Frame(parent)
+        control_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Camera toggle button
+        self.camera_toggle_btn = ttk.Button(
+            control_frame, 
+            text="Enable Camera", 
+            command=self.toggle_camera
+        )
+        self.camera_toggle_btn.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        # Camera display frame
+        display_frame = ttk.LabelFrame(parent, text="Camera Feed", padding="10")
+        display_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Canvas for displaying the camera feed
+        self.camera_canvas = tk.Canvas(
+            display_frame, 
+            width=DEFAULT_CAMERA_WIDTH, 
+            height=DEFAULT_CAMERA_HEIGHT,
+            bg="black"
+        )
+        self.camera_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # Add a label to show when camera is not enabled
+        self.camera_placeholder = ttk.Label(
+            self.camera_canvas, 
+            text="Camera feed will appear here when enabled",
+            foreground="white",
+            background="black"
+        )
+        self.camera_canvas.create_window(
+            DEFAULT_CAMERA_WIDTH // 2, 
+            DEFAULT_CAMERA_HEIGHT // 2, 
+            window=self.camera_placeholder
+        )
+    
+    def toggle_camera(self):
+        if not self.is_connected:
+            messagebox.showwarning("Not Connected", "Please connect to the robot first.")
+            return
+            
+        if self.camera_enabled.get():
+            # Disable camera
+            self.camera_enabled.set(False)
+            self.camera_toggle_btn.config(text="Enable Camera")
+            
+            # Stop the camera update
+            if self.camera_update_id:
+                self.root.after_cancel(self.camera_update_id)
+                self.camera_update_id = None
+                
+            # Show placeholder
+            self.camera_placeholder.place(
+                x=DEFAULT_CAMERA_WIDTH // 2, 
+                y=DEFAULT_CAMERA_HEIGHT // 2, 
+                anchor="center"
+            )
+            
+            # Disable video channel
+            if self.connection and hasattr(self.connection, 'video'):
+                asyncio.run_coroutine_threadsafe(self.disable_video_channel(), self.loop)
+        else:
+            # Enable camera
+            self.camera_enabled.set(True)
+            self.camera_toggle_btn.config(text="Disable Camera")
+            
+            # Hide placeholder
+            self.camera_placeholder.place_forget()
+            
+            # Enable video channel
+            if self.connection and hasattr(self.connection, 'video'):
+                asyncio.run_coroutine_threadsafe(self.enable_video_channel(), self.loop)
+                
+                # Start the camera update
+                self.update_camera_feed()
+    
+    async def enable_video_channel(self):
+        try:
+            # Enable video channel
+            self.connection.video.switchVideoChannel(True)
+            
+            # Add callback to handle received video frames
+            self.connection.video.add_track_callback(self.recv_camera_stream)
+            
+            logger.info("Video channel enabled")
+        except Exception as e:
+            logger.error(f"Error enabling video channel: {e}")
+            self.root.after(0, lambda: messagebox.showerror("Camera Error", f"Failed to enable camera: {e}"))
+    
+    async def disable_video_channel(self):
+        try:
+            # Disable video channel
+            self.connection.video.switchVideoChannel(False)
+            logger.info("Video channel disabled")
+        except Exception as e:
+            logger.error(f"Error disabling video channel: {e}")
+    
+    async def recv_camera_stream(self, track: MediaStreamTrack):
+        try:
+            while self.camera_enabled.get():
+                frame = await track.recv()
+                # Convert the frame to a NumPy array
+                img = frame.to_ndarray(format="bgr24")
+                self.frame_queue.put(img)
+        except asyncio.CancelledError:
+            logger.info("Camera stream task cancelled")
+        except Exception as e:
+            logger.error(f"Error in camera stream: {e}")
+            if "not connected" in str(e).lower() or "connection" in str(e).lower():
+                self.root.after(0, self.handle_connection_lost)
+    
+    def update_camera_feed(self):
+        if not self.camera_enabled.get():
+            return
+            
+        if not self.frame_queue.empty():
+            # Get the latest frame
+            frame = self.frame_queue.get()
+            
+            # Convert the OpenCV frame to a format Tkinter can display
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Resize the frame to fit the canvas if needed
+            canvas_width = self.camera_canvas.winfo_width()
+            canvas_height = self.camera_canvas.winfo_height()
+            
+            if canvas_width > 1 and canvas_height > 1:  # Ensure canvas has valid dimensions
+                frame_rgb = cv2.resize(frame_rgb, (canvas_width, canvas_height))
+            
+            # Convert to PIL Image
+            pil_img = Image.fromarray(frame_rgb)
+            
+            # Convert to PhotoImage
+            tk_img = ImageTk.PhotoImage(image=pil_img)
+            
+            # Keep a reference to prevent garbage collection
+            self.last_frame = tk_img
+            
+            # Update canvas
+            self.camera_canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
+        
+        # Schedule the next update
+        self.camera_update_id = self.root.after(33, self.update_camera_feed)  # ~30 FPS
+        
     def toggle_connection(self):
         if not self.is_connected:
             self.connect()
@@ -382,6 +549,23 @@ class RobotController:
             self.status_var.set("Connection lost. Please reconnect.")
             messagebox.showwarning("Connection Lost", "The connection to the robot has been lost. Please reconnect.")
             
+            # Disable camera if it was enabled
+            if self.camera_enabled.get():
+                self.camera_enabled.set(False)
+                self.camera_toggle_btn.config(text="Enable Camera")
+                
+                # Stop the camera update
+                if self.camera_update_id:
+                    self.root.after_cancel(self.camera_update_id)
+                    self.camera_update_id = None
+                
+                # Show placeholder
+                self.camera_placeholder.place(
+                    x=DEFAULT_CAMERA_WIDTH // 2, 
+                    y=DEFAULT_CAMERA_HEIGHT // 2, 
+                    anchor="center"
+                )
+            
             # Signal the event loop to shut down
             if self.shutdown_event and not self.shutdown_event.is_set():
                 self.loop.call_soon_threadsafe(self.shutdown_event.set)
@@ -441,6 +625,23 @@ class RobotController:
             self.status_var.set("Disconnecting...")
             self.root.update()
             
+            # Disable camera if it was enabled
+            if self.camera_enabled.get():
+                self.camera_enabled.set(False)
+                self.camera_toggle_btn.config(text="Enable Camera")
+                
+                # Stop the camera update
+                if self.camera_update_id:
+                    self.root.after_cancel(self.camera_update_id)
+                    self.camera_update_id = None
+                
+                # Show placeholder
+                self.camera_placeholder.place(
+                    x=DEFAULT_CAMERA_WIDTH // 2, 
+                    y=DEFAULT_CAMERA_HEIGHT // 2, 
+                    anchor="center"
+                )
+            
             # Signal the event loop to shut down
             if self.shutdown_event and not self.shutdown_event.is_set():
                 self.loop.call_soon_threadsafe(self.shutdown_event.set)
@@ -472,6 +673,24 @@ class RobotController:
         self.is_connected = False
         self.connect_button.config(text="Connect", state=tk.NORMAL)
         self.status_var.set("Disconnected")
+        
+        # Disable camera if it was enabled
+        if self.camera_enabled.get():
+            self.camera_enabled.set(False)
+            self.camera_toggle_btn.config(text="Enable Camera")
+            
+            # Stop the camera update
+            if self.camera_update_id:
+                self.root.after_cancel(self.camera_update_id)
+                self.camera_update_id = None
+            
+            # Show placeholder
+            self.camera_placeholder.place(
+                x=DEFAULT_CAMERA_WIDTH // 2, 
+                y=DEFAULT_CAMERA_HEIGHT // 2, 
+                anchor="center"
+            )
+        
         self.connection = None
         
     def send_command(self, command):
