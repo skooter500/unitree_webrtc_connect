@@ -11,6 +11,12 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 from queue import Queue
+import matplotlib
+matplotlib.use('TkAgg')
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 from go2_webrtc_driver.webrtc_driver import Go2WebRTCConnection, WebRTCConnectionMethod
 from go2_webrtc_driver.constants import RTC_TOPIC, SPORT_CMD
@@ -23,6 +29,10 @@ logger = logging.getLogger(__name__)
 # Default camera frame size
 DEFAULT_CAMERA_WIDTH = 640
 DEFAULT_CAMERA_HEIGHT = 360
+
+# Default lidar plot size
+DEFAULT_LIDAR_WIDTH = 640
+DEFAULT_LIDAR_HEIGHT = 480
 
 class RobotController:
     def __init__(self, root):
@@ -53,6 +63,15 @@ class RobotController:
         self.camera_enabled = tk.BooleanVar(value=False)
         self.camera_update_id = None
         self.last_frame = None
+        
+        # Lidar variables
+        self.lidar_enabled = tk.BooleanVar(value=False)
+        self.lidar_figure = None
+        self.lidar_canvas = None
+        self.lidar_ax = None
+        self.lidar_points = None
+        self.lidar_update_id = None
+        self.lidar_scatter = None
         
         # Create UI
         self.create_ui()
@@ -85,6 +104,11 @@ class RobotController:
         camera_frame = ttk.Frame(notebook, padding="10")
         notebook.add(camera_frame, text="Camera")
         self.create_camera_panel(camera_frame)
+        
+        # Lidar tab
+        lidar_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(lidar_frame, text="Lidar")
+        self.create_lidar_panel(lidar_frame)
         
         # Status bar at the bottom
         self.status_var = tk.StringVar(value="Not connected")
@@ -297,6 +321,44 @@ class RobotController:
             window=self.camera_placeholder
         )
     
+    def create_lidar_panel(self, parent):
+        # Lidar control frame
+        control_frame = ttk.Frame(parent)
+        control_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Lidar toggle button
+        self.lidar_toggle_btn = ttk.Button(
+            control_frame, 
+            text="Enable Lidar", 
+            command=self.toggle_lidar
+        )
+        self.lidar_toggle_btn.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        # Lidar display frame
+        display_frame = ttk.LabelFrame(parent, text="Lidar Visualization", padding="10")
+        display_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Create a matplotlib figure for the lidar visualization
+        self.lidar_figure = Figure(figsize=(6, 4), dpi=100)
+        self.lidar_ax = self.lidar_figure.add_subplot(111, projection='3d')
+        self.lidar_ax.set_xlabel('X')
+        self.lidar_ax.set_ylabel('Y')
+        self.lidar_ax.set_zlabel('Z')
+        self.lidar_ax.set_title('Lidar Point Cloud')
+        
+        # Create a canvas to display the figure
+        self.lidar_canvas = FigureCanvasTkAgg(self.lidar_figure, display_frame)
+        self.lidar_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Add a placeholder label
+        self.lidar_placeholder = ttk.Label(
+            display_frame,
+            text="Lidar visualization will appear here when enabled",
+            foreground="black",
+            background="white"
+        )
+        self.lidar_placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+    
     def toggle_camera(self):
         if not self.is_connected:
             messagebox.showwarning("Not Connected", "Please connect to the robot first.")
@@ -337,6 +399,50 @@ class RobotController:
                 # Start the camera update
                 self.update_camera_feed()
     
+    def toggle_lidar(self):
+        if not self.is_connected:
+            messagebox.showwarning("Not Connected", "Please connect to the robot first.")
+            return
+            
+        if self.lidar_enabled.get():
+            # Disable lidar
+            self.lidar_enabled.set(False)
+            self.lidar_toggle_btn.config(text="Enable Lidar")
+            
+            # Stop the lidar update
+            if self.lidar_update_id:
+                self.root.after_cancel(self.lidar_update_id)
+                self.lidar_update_id = None
+                
+            # Show placeholder
+            self.lidar_placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+            
+            # Disable lidar stream
+            if self.connection and hasattr(self.connection, 'datachannel'):
+                asyncio.run_coroutine_threadsafe(self.disable_lidar_stream(), self.loop)
+        else:
+            # Enable lidar
+            self.lidar_enabled.set(True)
+            self.lidar_toggle_btn.config(text="Disable Lidar")
+            
+            # Hide placeholder
+            self.lidar_placeholder.place_forget()
+            
+            # Clear the plot
+            self.lidar_ax.clear()
+            self.lidar_ax.set_xlabel('X')
+            self.lidar_ax.set_ylabel('Y')
+            self.lidar_ax.set_zlabel('Z')
+            self.lidar_ax.set_title('Lidar Point Cloud')
+            self.lidar_canvas.draw()
+            
+            # Enable lidar stream
+            if self.connection and hasattr(self.connection, 'datachannel'):
+                asyncio.run_coroutine_threadsafe(self.enable_lidar_stream(), self.loop)
+                
+                # Start the lidar update
+                self.update_lidar_plot()
+    
     async def enable_video_channel(self):
         try:
             # Enable video channel
@@ -357,6 +463,295 @@ class RobotController:
             logger.info("Video channel disabled")
         except Exception as e:
             logger.error(f"Error disabling video channel: {e}")
+    
+    async def enable_lidar_stream(self):
+        try:
+            if not self.connection:
+                raise ValueError("Connection is not established")
+                
+            if not hasattr(self.connection, 'datachannel') or self.connection.datachannel is None:
+                raise ValueError("Data channel is not available")
+                
+            # Disable traffic saving mode
+            try:
+                if hasattr(self.connection.datachannel, 'disableTrafficSaving'):
+                    # Check if the method is callable
+                    disable_traffic_saving = getattr(self.connection.datachannel, 'disableTrafficSaving', None)
+                    if callable(disable_traffic_saving):
+                        await disable_traffic_saving(True)
+                    else:
+                        logger.warning("disableTrafficSaving is not callable")
+                else:
+                    logger.warning("disableTrafficSaving method not available")
+            except Exception as e:
+                logger.warning(f"Error disabling traffic saving: {e}")
+                # Continue even if this fails
+            
+            # Set the decoder type
+            try:
+                if hasattr(self.connection.datachannel, 'set_decoder'):
+                    # Check if the method is callable
+                    set_decoder = getattr(self.connection.datachannel, 'set_decoder', None)
+                    if callable(set_decoder):
+                        set_decoder(decoder_type='libvoxel')
+                        logger.info("Set decoder to libvoxel")
+                    else:
+                        logger.warning("set_decoder is not callable")
+                else:
+                    logger.warning("set_decoder method not available")
+            except Exception as e:
+                logger.warning(f"Error setting decoder: {e}")
+                # Continue even if this fails
+            
+            # Turn on the LIDAR sensor
+            if hasattr(self.connection.datachannel, 'pub_sub') and self.connection.datachannel.pub_sub is not None:
+                try:
+                    # Try different methods to turn on the LIDAR sensor
+                    lidar_turned_on = False
+                    
+                    # Method 1: Try publish_request_new
+                    if not lidar_turned_on and hasattr(self.connection.datachannel.pub_sub, 'publish_request_new'):
+                        publish_request_new = getattr(self.connection.datachannel.pub_sub, 'publish_request_new', None)
+                        if callable(publish_request_new):
+                            try:
+                                await publish_request_new("rt/utlidar/switch", "on")
+                                logger.info("Turned on LIDAR sensor using publish_request_new")
+                                lidar_turned_on = True
+                            except Exception as e:
+                                logger.warning(f"Error using publish_request_new: {e}")
+                    
+                    # Method 2: Try publish
+                    if not lidar_turned_on and hasattr(self.connection.datachannel.pub_sub, 'publish'):
+                        publish = getattr(self.connection.datachannel.pub_sub, 'publish', None)
+                        if callable(publish):
+                            try:
+                                publish("rt/utlidar/switch", "on")
+                                logger.info("Turned on LIDAR sensor using publish")
+                                lidar_turned_on = True
+                            except Exception as e:
+                                logger.warning(f"Error using publish: {e}")
+                    
+                    # Method 3: Try publish_without_callback as last resort
+                    if not lidar_turned_on and hasattr(self.connection.datachannel.pub_sub, 'publish_without_callback'):
+                        publish_without_callback = getattr(self.connection.datachannel.pub_sub, 'publish_without_callback', None)
+                        if callable(publish_without_callback):
+                            try:
+                                await publish_without_callback("rt/utlidar/switch", "on")
+                                logger.info("Turned on LIDAR sensor using publish_without_callback")
+                                lidar_turned_on = True
+                            except Exception as e:
+                                logger.warning(f"Error using publish_without_callback: {e}")
+                    
+                    if not lidar_turned_on:
+                        logger.warning("Could not turn on LIDAR sensor using any available method")
+                except Exception as e:
+                    logger.warning(f"Error turning on LIDAR sensor: {e}")
+                    # Continue even if this fails
+                
+                # Subscribe to the lidar data channel
+                try:
+                    if hasattr(self.connection.datachannel.pub_sub, 'subscribe'):
+                        # Check if the method is callable
+                        subscribe = getattr(self.connection.datachannel.pub_sub, 'subscribe', None)
+                        if callable(subscribe):
+                            # First unsubscribe to avoid duplicate callbacks
+                            if hasattr(self.connection.datachannel.pub_sub, 'unsubscribe'):
+                                unsubscribe = getattr(self.connection.datachannel.pub_sub, 'unsubscribe', None)
+                                if callable(unsubscribe):
+                                    # The unsubscribe method only takes the topic name, not the callback
+                                    unsubscribe("rt/utlidar/voxel_map_compressed")
+                                    logger.info("Unsubscribed from previous lidar data channel")
+                            
+                            # Now subscribe
+                            subscribe("rt/utlidar/voxel_map_compressed", self.lidar_callback)
+                            logger.info("Subscribed to lidar data channel")
+                        else:
+                            logger.warning("subscribe is not callable")
+                    else:
+                        logger.warning("subscribe method not available")
+                except Exception as e:
+                    logger.warning(f"Error subscribing to lidar data channel: {e}")
+                    # Continue even if this fails
+            else:
+                logger.warning("pub_sub is not available")
+            
+            logger.info("Lidar stream enabled")
+        except Exception as e:
+            logger.error(f"Error enabling lidar stream: {e}")
+            error_msg = str(e)
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Lidar Error", f"Failed to enable lidar: {msg}"))
+    
+    async def disable_lidar_stream(self):
+        try:
+            if not self.connection:
+                return
+                
+            if not hasattr(self.connection, 'datachannel') or self.connection.datachannel is None:
+                return
+                
+            # Turn off the LIDAR sensor
+            if hasattr(self.connection.datachannel, 'pub_sub') and self.connection.datachannel.pub_sub is not None:
+                try:
+                    # Try different methods to turn off the LIDAR sensor
+                    lidar_turned_off = False
+                    
+                    # Method 1: Try publish_request_new
+                    if not lidar_turned_off and hasattr(self.connection.datachannel.pub_sub, 'publish_request_new'):
+                        publish_request_new = getattr(self.connection.datachannel.pub_sub, 'publish_request_new', None)
+                        if callable(publish_request_new):
+                            try:
+                                await publish_request_new("rt/utlidar/switch", "off")
+                                logger.info("Turned off LIDAR sensor using publish_request_new")
+                                lidar_turned_off = True
+                            except Exception as e:
+                                logger.warning(f"Error using publish_request_new: {e}")
+                    
+                    # Method 2: Try publish
+                    if not lidar_turned_off and hasattr(self.connection.datachannel.pub_sub, 'publish'):
+                        publish = getattr(self.connection.datachannel.pub_sub, 'publish', None)
+                        if callable(publish):
+                            try:
+                                publish("rt/utlidar/switch", "off")
+                                logger.info("Turned off LIDAR sensor using publish")
+                                lidar_turned_off = True
+                            except Exception as e:
+                                logger.warning(f"Error using publish: {e}")
+                    
+                    # Method 3: Try publish_without_callback as last resort
+                    if not lidar_turned_off and hasattr(self.connection.datachannel.pub_sub, 'publish_without_callback'):
+                        publish_without_callback = getattr(self.connection.datachannel.pub_sub, 'publish_without_callback', None)
+                        if callable(publish_without_callback):
+                            try:
+                                await publish_without_callback("rt/utlidar/switch", "off")
+                                logger.info("Turned off LIDAR sensor using publish_without_callback")
+                                lidar_turned_off = True
+                            except Exception as e:
+                                logger.warning(f"Error using publish_without_callback: {e}")
+                    
+                    if not lidar_turned_off:
+                        logger.warning("Could not turn off LIDAR sensor using any available method")
+                except Exception as e:
+                    logger.warning(f"Error turning off LIDAR sensor: {e}")
+                    # Continue even if this fails
+                
+                # Unsubscribe from the lidar data channel
+                try:
+                    if hasattr(self.connection.datachannel.pub_sub, 'unsubscribe'):
+                        # Check if the method is callable
+                        unsubscribe = getattr(self.connection.datachannel.pub_sub, 'unsubscribe', None)
+                        if callable(unsubscribe):
+                            # The unsubscribe method only takes the topic name, not the callback
+                            unsubscribe("rt/utlidar/voxel_map_compressed")
+                            logger.info("Unsubscribed from lidar data channel")
+                        else:
+                            logger.warning("unsubscribe is not callable")
+                    else:
+                        logger.warning("unsubscribe method not available")
+                except Exception as e:
+                    logger.warning(f"Error unsubscribing from lidar data channel: {e}")
+                    # Continue even if this fails
+            
+            logger.info("Lidar stream disabled")
+        except Exception as e:
+            logger.error(f"Error disabling lidar stream: {e}")
+    
+    def lidar_callback(self, data):
+        try:
+            if not self.lidar_enabled.get():
+                return
+                
+            # Log the data type for debugging
+            logger.info(f"Received lidar data of type: {type(data)}")
+            
+            # Check if data is a dictionary (decoded JSON)
+            if isinstance(data, dict):
+                # Extract point cloud data from the lidar data
+                points = []
+                if 'points' in data and isinstance(data['points'], list):
+                    for point in data['points']:
+                        if isinstance(point, dict) and 'x' in point and 'y' in point and 'z' in point:
+                            x, y, z = point['x'], point['y'], point['z']
+                            points.append([x, y, z])
+                    
+                    # Store the points for visualization if we have any
+                    if points:
+                        self.lidar_points = np.array(points)
+                        logger.info(f"Processed lidar data with {len(points)} points")
+                    else:
+                        logger.warning("Received lidar data with no valid points")
+                else:
+                    logger.warning("Received lidar data with invalid format (no points list)")
+            # Check if data is binary (raw data)
+            elif isinstance(data, (bytes, bytearray)):
+                logger.info(f"Received binary lidar data of length: {len(data)}")
+                # For binary data, we need to wait for the decoder to process it
+                # The decoder will convert it to a format with points that we can visualize
+                logger.info("Binary data will be processed by the decoder")
+            else:
+                logger.warning(f"Received lidar data with unexpected type: {type(data)}")
+                
+        except Exception as e:
+            logger.error(f"Error in lidar callback: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def update_lidar_plot(self):
+        if not self.lidar_enabled.get():
+            return
+            
+        try:
+            if self.lidar_points is not None and len(self.lidar_points) > 0:
+                # Clear the previous plot
+                self.lidar_ax.clear()
+                
+                # Set the axis labels and title
+                self.lidar_ax.set_xlabel('X')
+                self.lidar_ax.set_ylabel('Y')
+                self.lidar_ax.set_zlabel('Z')
+                self.lidar_ax.set_title(f'Lidar Point Cloud ({len(self.lidar_points)} points)')
+                
+                # Plot the points
+                x = self.lidar_points[:, 0]
+                y = self.lidar_points[:, 1]
+                z = self.lidar_points[:, 2]
+                
+                # Calculate distance for coloring
+                distances = np.sqrt(x**2 + y**2 + z**2)
+                
+                # Create a scatter plot
+                self.lidar_scatter = self.lidar_ax.scatter(x, y, z, c=distances, cmap='viridis', s=1)
+                
+                # Set axis limits
+                max_range = np.max([np.max(np.abs(x)), np.max(np.abs(y)), np.max(np.abs(z))])
+                self.lidar_ax.set_xlim([-max_range, max_range])
+                self.lidar_ax.set_ylim([-max_range, max_range])
+                self.lidar_ax.set_zlim([-max_range, max_range])
+                
+                # Add a colorbar
+                if not hasattr(self, 'colorbar') or self.colorbar is None:
+                    self.colorbar = self.lidar_figure.colorbar(self.lidar_scatter, ax=self.lidar_ax)
+                    self.colorbar.set_label('Distance (m)')
+                else:
+                    self.colorbar.update_normal(self.lidar_scatter)
+                
+                # Set the view angle for better visualization
+                self.lidar_ax.view_init(elev=30, azim=45)
+                
+                # Redraw the canvas
+                self.lidar_canvas.draw()
+                
+                # Log success
+                logger.info(f"Updated lidar plot with {len(self.lidar_points)} points")
+            else:
+                # Log that we're waiting for data
+                logger.debug("Waiting for lidar data to visualize...")
+        except Exception as e:
+            logger.error(f"Error updating lidar plot: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+        # Schedule the next update
+        self.lidar_update_id = self.root.after(100, self.update_lidar_plot)  # Update at 10 Hz
     
     async def recv_camera_stream(self, track: MediaStreamTrack):
         try:
@@ -566,6 +961,19 @@ class RobotController:
                     anchor="center"
                 )
             
+            # Disable lidar if it was enabled
+            if self.lidar_enabled.get():
+                self.lidar_enabled.set(False)
+                self.lidar_toggle_btn.config(text="Enable Lidar")
+                
+                # Stop the lidar update
+                if self.lidar_update_id:
+                    self.root.after_cancel(self.lidar_update_id)
+                    self.lidar_update_id = None
+                
+                # Show placeholder
+                self.lidar_placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+            
             # Signal the event loop to shut down
             if self.shutdown_event and not self.shutdown_event.is_set():
                 self.loop.call_soon_threadsafe(self.shutdown_event.set)
@@ -642,6 +1050,19 @@ class RobotController:
                     anchor="center"
                 )
             
+            # Disable lidar if it was enabled
+            if self.lidar_enabled.get():
+                self.lidar_enabled.set(False)
+                self.lidar_toggle_btn.config(text="Enable Lidar")
+                
+                # Stop the lidar update
+                if self.lidar_update_id:
+                    self.root.after_cancel(self.lidar_update_id)
+                    self.lidar_update_id = None
+                
+                # Show placeholder
+                self.lidar_placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+            
             # Signal the event loop to shut down
             if self.shutdown_event and not self.shutdown_event.is_set():
                 self.loop.call_soon_threadsafe(self.shutdown_event.set)
@@ -667,7 +1088,7 @@ class RobotController:
         except Exception as e:
             logger.error(f"Disconnection error: {e}")
             error_msg = str(e)
-            self.root.after(0, lambda: messagebox.showerror("Disconnection Error", f"Failed to disconnect: {error_msg}"))
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Disconnection Error", f"Failed to disconnect: {error_msg}"))
             
     def update_ui_after_disconnect(self):
         self.is_connected = False
@@ -690,6 +1111,19 @@ class RobotController:
                 y=DEFAULT_CAMERA_HEIGHT // 2, 
                 anchor="center"
             )
+        
+        # Disable lidar if it was enabled
+        if self.lidar_enabled.get():
+            self.lidar_enabled.set(False)
+            self.lidar_toggle_btn.config(text="Enable Lidar")
+            
+            # Stop the lidar update
+            if self.lidar_update_id:
+                self.root.after_cancel(self.lidar_update_id)
+                self.lidar_update_id = None
+            
+            # Show placeholder
+            self.lidar_placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         
         self.connection = None
         
